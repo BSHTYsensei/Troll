@@ -207,8 +207,28 @@ jobs:
           test -x "$APP/PersistenceHelper"
           test -x "$APP/ldid"
           plutil -lint "$APP/Info.plist"
-          test -f "$APP/zh-Hans.lproj/Localizable.strings" || { echo "error: Chinese Localizable.strings was not copied into TrollStore.app" >&2; exit 1; }
-          grep -q 'è®¾ç½®' "$APP/zh-Hans.lproj/Localizable.strings" || { echo "error: built app localization contains no expected Chinese translation" >&2; exit 1; }
+          STRINGS_FILE=""
+          for candidate in \
+            "$APP/zh-Hans.lproj/Localizable.strings" \
+            "$APP/Resources/zh-Hans.lproj/Localizable.strings"; do
+            if [[ -f "$candidate" ]]; then STRINGS_FILE="$candidate"; break; fi
+          done
+          test -n "$STRINGS_FILE" || { echo "error: Chinese Localizable.strings was not copied into TrollStore.app (checked bundle root and Resources/)" >&2; find "$APP" -maxdepth 4 -name Localizable.strings -print; exit 1; }
+          # Theos/Xcode may leave .strings as UTF-8 text or compile it to a binary
+          # property list. Parse it with plutil/Python instead of grepping raw bytes.
+          plutil -lint "$STRINGS_FILE"
+          plutil -convert xml1 -o "$RUNNER_TEMP/trollstore-localizable.xml" "$STRINGS_FILE"
+          python3 - "$RUNNER_TEMP/trollstore-localizable.xml" <<'PYSTRINGS'
+          import plistlib, sys
+          with open(sys.argv[1], 'rb') as stream:
+              strings = plistlib.load(stream)
+          chinese_values = [value for value in strings.values() if isinstance(value, str) and any('\u4e00' <= ch <= '\u9fff' for ch in value)]
+          if not chinese_values:
+              raise SystemExit('error: built app localization has no Chinese translation values after parsing .strings')
+          if strings.get('Settings') != 'è®¾ç½®':
+              raise SystemExit("error: expected built translation Settings = è®¾ç½®, got %r" % strings.get('Settings'))
+          print('[localization] verified %d Chinese translation value(s) in %s' % (len(chinese_values), sys.argv[1]))
+          PYSTRINGS
           python3 Scripts/validate_macho.py "$APP/ldid"
           python3 Scripts/validate_macho.py "$APP/TrollStore"
           python3 Scripts/validate_macho.py "$APP/trollstorehelper"
