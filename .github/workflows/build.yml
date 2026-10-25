@@ -225,8 +225,9 @@ jobs:
           chinese_values = [value for value in strings.values() if isinstance(value, str) and any('\u4e00' <= ch <= '\u9fff' for ch in value)]
           if not chinese_values:
               raise SystemExit('error: built app localization has no Chinese translation values after parsing .strings')
-          if strings.get('Settings') != 'è®¾ç½®':
-              raise SystemExit("error: expected built translation Settings = è®¾ç½®, got %r" % strings.get('Settings'))
+          expected_settings = '\u8bbe\u7f6e'
+          if strings.get('Settings') != expected_settings:
+              raise SystemExit("error: expected built translation Settings = %s, got %r" % (expected_settings, strings.get('Settings')))
           print('[localization] verified %d Chinese translation value(s) in %s' % (len(chinese_values), sys.argv[1]))
           PYSTRINGS
           python3 Scripts/validate_macho.py "$APP/ldid"
