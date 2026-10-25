@@ -205,7 +205,8 @@ jobs:
           test -x "$APP/TrollStore"
           test -x "$APP/trollstorehelper"
           test -x "$APP/PersistenceHelper"
-          test -x "$APP/ldid"
+          test -x "$APP/ldid-bootstrap/ldid"
+          test ! -e "$APP/ldid" || { echo "error: active ldid must not be initialized in the build artifact by default" >&2; exit 1; }
           plutil -lint "$APP/Info.plist"
           STRINGS_FILE=""
           for candidate in \
@@ -230,7 +231,7 @@ jobs:
               raise SystemExit("error: expected built translation Settings = %s, got %r" % (expected_settings, strings.get('Settings')))
           print('[localization] verified %d Chinese translation value(s) in %s' % (len(chinese_values), sys.argv[1]))
           PYSTRINGS
-          python3 Scripts/validate_macho.py "$APP/ldid"
+          python3 Scripts/validate_macho.py "$APP/ldid-bootstrap/ldid"
           python3 Scripts/validate_macho.py "$APP/TrollStore"
           python3 Scripts/validate_macho.py "$APP/trollstorehelper"
           python3 Scripts/validate_macho.py "$APP/PersistenceHelper"
