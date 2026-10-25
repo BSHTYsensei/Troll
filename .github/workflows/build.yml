@@ -1,4 +1,4 @@
-name: Build TrollStore (Original UI + Simplified Chinese)
+name: Build TrollStore (Objective-C/C, Original UI + Simplified Chinese)
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: trollstore-swift-${{ github.ref }}
+  group: trollstore-objc-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -66,15 +66,15 @@ jobs:
           candidates = []
           for marker in staging.rglob("Scripts/validate_project.py"):
               root = marker.parent.parent
-              # The localized project preserves TrollStore's original Objective-C
-              # UI/controllers. It intentionally does NOT contain three replacement
-              # Swift files; only the Entitlements settings page is Swift.
+              # The project is Objective-C/C-only, including the pre-install
+              # Entitlements editor. No Swift sources or Swift bootstrap are used.
               required = (
                   root / "Makefile",
                   root / "TrollStore" / "TSRootViewController.m",
                   root / "TrollStore" / "TSAppTableViewController.m",
                   root / "TrollStore" / "TSInstallationController.m",
-                  root / "TrollStore" / "TSEntitlementsEditorViewController.swift",
+                  root / "TrollStore" / "TSEntitlementsEditorViewController.m",
+                  root / "TrollStore" / "TSEntitlementsEditorViewController.h",
                   root / "RootHelper" / "main.m",
                   root / "TrollHelper" / "main.m",
                   root / "Scripts" / "validate_choma_api.py",
@@ -106,25 +106,11 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: python3 Scripts/validate_project.py
 
-      - name: Parse all Swift sources
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          count=0
-          while IFS= read -r -d '' source; do
-            echo "[swift-parse] $source"
-            swiftc -frontend -parse "$source"
-            count=$((count + 1))
-          done < <(find TrollStore RootHelper TrollHelper Shared -type f -name '*.swift' -print0)
-          test "$count" -gt 0 || { echo "error: no Swift sources found" >&2; exit 1; }
-          echo "[swift-parse] checked $count Swift source file(s)"
-
       - name: Cache Theos toolchain and SDKs
         uses: actions/cache@v4
         with:
           path: .theos
-          key: theos-macos15-iphoneos16.5-swift5-v3
+          key: theos-macos15-iphoneos16.5-objc-v4
 
       - name: Install host build dependencies
         shell: bash
@@ -158,11 +144,6 @@ jobs:
             cp -R "$RUNNER_TEMP/theos-sdks/iPhoneOS16.5.sdk" "$THEOS/sdks/"
           fi
           test -f "$THEOS/sdks/iPhoneOS16.5.sdk/SDKSettings.plist" || { echo "error: iPhoneOS16.5.sdk missing"; exit 1; }
-
-      - name: Bootstrap Theos Swift support before parallel targets
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: make bootstrap-swift-support THEOS="$THEOS"
 
       - name: Cache ChOma source dependency
         uses: actions/cache@v4
@@ -205,8 +186,7 @@ jobs:
           test -x "$APP/TrollStore"
           test -x "$APP/trollstorehelper"
           test -x "$APP/PersistenceHelper"
-          test -x "$APP/ldid-bootstrap/ldid"
-          test ! -e "$APP/ldid" || { echo "error: active ldid must not be initialized in the build artifact by default" >&2; exit 1; }
+          test -x "$APP/ldid"
           plutil -lint "$APP/Info.plist"
           STRINGS_FILE=""
           for candidate in \
@@ -231,7 +211,7 @@ jobs:
               raise SystemExit("error: expected built translation Settings = %s, got %r" % (expected_settings, strings.get('Settings')))
           print('[localization] verified %d Chinese translation value(s) in %s' % (len(chinese_values), sys.argv[1]))
           PYSTRINGS
-          python3 Scripts/validate_macho.py "$APP/ldid-bootstrap/ldid"
+          python3 Scripts/validate_macho.py "$APP/ldid"
           python3 Scripts/validate_macho.py "$APP/TrollStore"
           python3 Scripts/validate_macho.py "$APP/trollstorehelper"
           python3 Scripts/validate_macho.py "$APP/PersistenceHelper"
@@ -249,7 +229,7 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TrollStore-Swift-build
+          name: TrollStore-ObjectiveC-build
           path: project/_build/TrollStore.tar
           if-no-files-found: error
           retention-days: 14
