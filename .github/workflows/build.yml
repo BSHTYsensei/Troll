@@ -183,10 +183,33 @@ jobs:
           mkdir -p "$RUNNER_TEMP/trollstore-smoke"
           tar -xzf _build/TrollStore.tar -C "$RUNNER_TEMP/trollstore-smoke"
           APP="$RUNNER_TEMP/trollstore-smoke/TrollStore.app"
-          test -x "$APP/TrollStore"
-          test -x "$APP/trollstorehelper"
-          test -x "$APP/PersistenceHelper"
-          test -x "$APP/ldid"
+
+          require_executable() {
+            local path="$1"
+            if [[ ! -x "$path" ]]; then
+              echo "error: expected executable missing from built app: $path" >&2
+              echo "[smoke] executable files at app root:" >&2
+              find "$APP" -maxdepth 2 -type f -perm -111 -print 2>/dev/null | sort >&2 || true
+              exit 1
+            fi
+            echo "[smoke] executable OK: ${path#"$APP"/}"
+          }
+
+          require_executable "$APP/TrollStore"
+          require_executable "$APP/trollstorehelper"
+          require_executable "$APP/PersistenceHelper"
+
+          # Auto-initialize is intentionally OFF by default. The supplied ldid
+          # must be bundled as an inactive bootstrap resource, not installed at
+          # the active $APP/ldid path. The previous workflow checked the wrong
+          # location and silently exited because `test -x` prints no error.
+          require_executable "$APP/ldid-bootstrap/ldid"
+          if [[ ! -x "$APP/ldid" ]]; then
+            echo "[smoke] ldid is correctly bundled at ldid-bootstrap/ldid (auto-initialize default remains OFF)"
+          else
+            echo "[smoke] note: active ldid path exists in build artifact"
+          fi
+
           plutil -lint "$APP/Info.plist"
           STRINGS_FILE=""
           for candidate in \
@@ -194,9 +217,14 @@ jobs:
             "$APP/Resources/zh-Hans.lproj/Localizable.strings"; do
             if [[ -f "$candidate" ]]; then STRINGS_FILE="$candidate"; break; fi
           done
-          test -n "$STRINGS_FILE" || { echo "error: Chinese Localizable.strings was not copied into TrollStore.app (checked bundle root and Resources/)" >&2; find "$APP" -maxdepth 4 -name Localizable.strings -print; exit 1; }
-          # Theos/Xcode may leave .strings as UTF-8 text or compile it to a binary
-          # property list. Parse it with plutil/Python instead of grepping raw bytes.
+          if [[ -z "$STRINGS_FILE" ]]; then
+            echo "error: Chinese Localizable.strings was not copied into TrollStore.app" >&2
+            find "$APP" -maxdepth 5 -name Localizable.strings -print >&2 || true
+            exit 1
+          fi
+          echo "[smoke] localization resource found: ${STRINGS_FILE#"$APP"/}"
+
+          # Theos may leave .strings as UTF-8 text or compile it to a property list.
           plutil -lint "$STRINGS_FILE"
           plutil -convert xml1 -o "$RUNNER_TEMP/trollstore-localizable.xml" "$STRINGS_FILE"
           python3 - "$RUNNER_TEMP/trollstore-localizable.xml" <<'PYSTRINGS'
@@ -209,9 +237,10 @@ jobs:
           expected_settings = '\u8bbe\u7f6e'
           if strings.get('Settings') != expected_settings:
               raise SystemExit("error: expected built translation Settings = %s, got %r" % (expected_settings, strings.get('Settings')))
-          print('[localization] verified %d Chinese translation value(s) in %s' % (len(chinese_values), sys.argv[1]))
+          print('[localization] verified %d Chinese translation value(s)' % len(chinese_values))
           PYSTRINGS
-          python3 Scripts/validate_macho.py "$APP/ldid"
+
+          python3 Scripts/validate_macho.py "$APP/ldid-bootstrap/ldid"
           python3 Scripts/validate_macho.py "$APP/TrollStore"
           python3 Scripts/validate_macho.py "$APP/trollstorehelper"
           python3 Scripts/validate_macho.py "$APP/PersistenceHelper"
