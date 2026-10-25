@@ -1,4 +1,4 @@
-name: Build TrollStore Swift
+name: Build TrollStore (Original UI + Simplified Chinese)
 
 on:
   push:
@@ -66,18 +66,27 @@ jobs:
           candidates = []
           for marker in staging.rglob("Scripts/validate_project.py"):
               root = marker.parent.parent
+              # The localized project preserves TrollStore's original Objective-C
+              # UI/controllers. It intentionally does NOT contain three replacement
+              # Swift files; only the Entitlements settings page is Swift.
               required = (
                   root / "Makefile",
-                  root / "TrollStore" / "TrollStore.swift",
-                  root / "RootHelper" / "RootHelper.swift",
-                  root / "TrollHelper" / "TrollHelper.swift",
+                  root / "TrollStore" / "TSRootViewController.m",
+                  root / "TrollStore" / "TSAppTableViewController.m",
+                  root / "TrollStore" / "TSInstallationController.m",
+                  root / "TrollStore" / "TSEntitlementsEditorViewController.swift",
+                  root / "RootHelper" / "main.m",
+                  root / "TrollHelper" / "main.m",
+                  root / "Scripts" / "validate_choma_api.py",
+                  root / "TrollStore" / "Resources" / "zh-Hans.lproj" / "Localizable.strings",
+                  root / "TrollHelper" / "Resources" / "zh-Hans.lproj" / "Localizable.strings",
                   root / "bin" / "ldid",
               )
               if all(path.is_file() for path in required):
                   candidates.append(root)
 
-          # A flat archive has its project root at staging itself; rglob also
-          # finds this path for the marker above.
+          # Accept either a flat archive or one enclosing folder; find the actual
+          # project via its audit script and original TrollStore source markers.
           unique = list(dict.fromkeys(candidates))
           if len(unique) != 1:
               raise SystemExit(
@@ -102,15 +111,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for source in TrollStore/TrollStore.swift RootHelper/RootHelper.swift TrollHelper/TrollHelper.swift; do
+          count=0
+          while IFS= read -r -d '' source; do
+            echo "[swift-parse] $source"
             swiftc -frontend -parse "$source"
-          done
+            count=$((count + 1))
+          done < <(find TrollStore RootHelper TrollHelper Shared -type f -name '*.swift' -print0)
+          test "$count" -gt 0 || { echo "error: no Swift sources found" >&2; exit 1; }
+          echo "[swift-parse] checked $count Swift source file(s)"
 
       - name: Cache Theos toolchain and SDKs
         uses: actions/cache@v4
         with:
           path: .theos
-          key: theos-macos15-iphoneos16.5-swift5-v2
+          key: theos-macos15-iphoneos16.5-swift5-v3
 
       - name: Install host build dependencies
         shell: bash
@@ -173,7 +187,7 @@ jobs:
           file bin/ldid
           python3 Scripts/validate_macho.py bin/ldid
 
-      - name: Build optimized Swift targets
+      - name: Build TrollStore targets with precompiled ldid
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
@@ -193,6 +207,8 @@ jobs:
           test -x "$APP/PersistenceHelper"
           test -x "$APP/ldid"
           plutil -lint "$APP/Info.plist"
+          test -f "$APP/zh-Hans.lproj/Localizable.strings" || { echo "error: Chinese Localizable.strings was not copied into TrollStore.app" >&2; exit 1; }
+          grep -q 'è®¾ç½®' "$APP/zh-Hans.lproj/Localizable.strings" || { echo "error: built app localization contains no expected Chinese translation" >&2; exit 1; }
           python3 Scripts/validate_macho.py "$APP/ldid"
           python3 Scripts/validate_macho.py "$APP/TrollStore"
           python3 Scripts/validate_macho.py "$APP/trollstorehelper"
@@ -203,7 +219,9 @@ jobs:
               info = plistlib.load(f)
           assert info.get('CFBundleExecutable') == 'TrollStore', 'unexpected CFBundleExecutable'
           assert set(info.get('TSRootBinaries', [])) >= {'trollstorehelper', 'ldid'}, 'TSRootBinaries is missing expected tools'
-          print('TrollStore.app artifact layout verified')
+          assert info.get('CFBundleDevelopmentRegion') == 'zh-Hans', 'Chinese is not the default localization'
+          assert info.get('CFBundleLocalizations') == ['zh-Hans'], 'unexpected supported localization list; Chinese should be the fallback'
+          print('TrollStore.app artifact layout and default Chinese localization verified')
           PY
 
       - name: Upload build artifact
