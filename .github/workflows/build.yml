@@ -1,0 +1,215 @@
+name: Build TrollStore Swift
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trollstore-swift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      THEOS: ${{ github.workspace }}/.theos
+      PROJECT_DIR: ${{ github.workspace }}/project
+      BUILD_JOBS: 2
+    steps:
+      - name: Checkout workflow and TrollStore.zip
+        uses: actions/checkout@v4
+
+      - name: Extract TrollStore.zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="$GITHUB_WORKSPACE/TrollStore.zip"
+          STAGING="$RUNNER_TEMP/trollstore-zip-unpacked"
+          DEST="$PROJECT_DIR"
+
+          if [[ ! -f "$ARCHIVE" ]]; then
+            echo "error: TrollStore.zip must be placed at the repository root: $ARCHIVE"
+            exit 1
+          fi
+          command -v python3 >/dev/null
+          rm -rf "$STAGING" "$DEST"
+          mkdir -p "$STAGING" "$DEST"
+
+          # Safely unpack the supplied ZIP, accepting either a flat archive or
+          # one containing a single enclosing project directory.
+          python3 - "$ARCHIVE" "$STAGING" "$DEST" <<'PY'
+          import os
+          import shutil
+          import sys
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          archive = Path(sys.argv[1])
+          staging = Path(sys.argv[2])
+          destination = Path(sys.argv[3])
+
+          if not zipfile.is_zipfile(archive):
+              raise SystemExit("error: TrollStore.zip is not a valid ZIP archive")
+
+          with zipfile.ZipFile(archive) as zf:
+              for item in zf.infolist():
+                  path = PurePosixPath(item.filename)
+                  if path.is_absolute() or ".." in path.parts:
+                      raise SystemExit(f"error: unsafe archive path: {item.filename!r}")
+              zf.extractall(staging)
+
+          candidates = []
+          for marker in staging.rglob("Scripts/validate_project.py"):
+              root = marker.parent.parent
+              required = (
+                  root / "Makefile",
+                  root / "TrollStore" / "TrollStore.swift",
+                  root / "RootHelper" / "RootHelper.swift",
+                  root / "TrollHelper" / "TrollHelper.swift",
+                  root / "bin" / "ldid",
+              )
+              if all(path.is_file() for path in required):
+                  candidates.append(root)
+
+          # A flat archive has its project root at staging itself; rglob also
+          # finds this path for the marker above.
+          unique = list(dict.fromkeys(candidates))
+          if len(unique) != 1:
+              raise SystemExit(
+                  "error: expected exactly one complete TrollStore project in TrollStore.zip; "
+                  f"found {len(unique)} candidate project roots"
+              )
+
+          source = unique[0]
+          shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)
+          ldid = destination / "bin" / "ldid"
+          ldid.chmod(ldid.stat().st_mode | 0o111)
+          print(f"[archive] extracted project from {archive.name} into {destination}")
+          print(f"[archive] found bundled precompiled ldid ({ldid.stat().st_size:,} bytes)")
+          PY
+
+      - name: Audit sources and resources
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: python3 Scripts/validate_project.py
+
+      - name: Parse all Swift sources
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for source in TrollStore/TrollStore.swift RootHelper/RootHelper.swift TrollHelper/TrollHelper.swift; do
+            swiftc -frontend -parse "$source"
+          done
+
+      - name: Cache Theos toolchain and SDKs
+        uses: actions/cache@v4
+        with:
+          path: .theos
+          key: theos-macos15-iphoneos16.5-swift5-v2
+
+      - name: Install host build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          for formula in make pkg-config openssl@3 libarchive xz; do
+            if ! brew list --versions "$formula" >/dev/null 2>&1; then
+              brew install "$formula"
+            fi
+          done
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Install Theos and iOS SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Clone Theos directly rather than running its full installer, which
+          # also downloads extra SDKs that this project does not need.
+          if [[ ! -d "$THEOS/makefiles" ]]; then
+            rm -rf "$THEOS"
+            git clone --depth 1 --recurse-submodules https://github.com/theos/theos.git "$THEOS"
+          fi
+          test -d "$THEOS/makefiles" || { echo "error: Theos installation failed (THEOS=$THEOS)"; exit 1; }
+          mkdir -p "$THEOS/sdks"
+          if [[ ! -f "$THEOS/sdks/iPhoneOS16.5.sdk/SDKSettings.plist" ]]; then
+            git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$RUNNER_TEMP/theos-sdks"
+            git -C "$RUNNER_TEMP/theos-sdks" sparse-checkout set iPhoneOS16.5.sdk
+            test -f "$RUNNER_TEMP/theos-sdks/iPhoneOS16.5.sdk/SDKSettings.plist" || { echo "error: iPhoneOS16.5.sdk not found in Theos SDK repository"; exit 1; }
+            cp -R "$RUNNER_TEMP/theos-sdks/iPhoneOS16.5.sdk" "$THEOS/sdks/"
+          fi
+          test -f "$THEOS/sdks/iPhoneOS16.5.sdk/SDKSettings.plist" || { echo "error: iPhoneOS16.5.sdk missing"; exit 1; }
+
+      - name: Cache ChOma source dependency
+        uses: actions/cache@v4
+        with:
+          path: project/ChOma
+          key: choma-source-${{ runner.os }}-opa334-main-v1
+
+      - name: Fetch ChOma dependency
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f ChOma/src/CSBlob.h || ! -f ChOma/external/ios/libcrypto.a ]]; then
+            rm -rf ChOma
+            git clone --depth 1 --recurse-submodules https://github.com/opa334/ChOma.git ChOma
+          fi
+          test -f ChOma/src/CSBlob.h || { echo "error: ChOma/src/CSBlob.h is missing"; exit 1; }
+          test -f ChOma/external/ios/libcrypto.a || { echo "error: ChOma/external/ios/libcrypto.a is missing"; exit 1; }
+
+      - name: Validate bundled precompiled device ldid
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f bin/ldid || { echo "error: bundled bin/ldid is missing from TrollStore.zip"; exit 1; }
+          chmod 755 bin/ldid
+          file bin/ldid
+          python3 Scripts/validate_macho.py bin/ldid
+
+      - name: Build optimized Swift targets
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          make assemble_trollstore THEOS="$THEOS" LDID_BIN="$PROJECT_DIR/bin/ldid" BUILD_JOBS="$BUILD_JOBS"
+
+      - name: Smoke-test build artifact
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trollstore-smoke"
+          tar -xzf _build/TrollStore.tar -C "$RUNNER_TEMP/trollstore-smoke"
+          APP="$RUNNER_TEMP/trollstore-smoke/TrollStore.app"
+          test -x "$APP/TrollStore"
+          test -x "$APP/trollstorehelper"
+          test -x "$APP/PersistenceHelper"
+          test -x "$APP/ldid"
+          plutil -lint "$APP/Info.plist"
+          python3 Scripts/validate_macho.py "$APP/ldid"
+          python3 Scripts/validate_macho.py "$APP/TrollStore"
+          python3 Scripts/validate_macho.py "$APP/trollstorehelper"
+          python3 Scripts/validate_macho.py "$APP/PersistenceHelper"
+          python3 - "$APP/Info.plist" <<'PY'
+          import plistlib, sys
+          with open(sys.argv[1], 'rb') as f:
+              info = plistlib.load(f)
+          assert info.get('CFBundleExecutable') == 'TrollStore', 'unexpected CFBundleExecutable'
+          assert set(info.get('TSRootBinaries', [])) >= {'trollstorehelper', 'ldid'}, 'TSRootBinaries is missing expected tools'
+          print('TrollStore.app artifact layout verified')
+          PY
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrollStore-Swift-build
+          path: project/_build/TrollStore.tar
+          if-no-files-found: error
+          retention-days: 14
