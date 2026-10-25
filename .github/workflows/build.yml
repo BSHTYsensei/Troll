@@ -145,23 +145,23 @@ jobs:
           fi
           test -f "$THEOS/sdks/iPhoneOS16.5.sdk/SDKSettings.plist" || { echo "error: iPhoneOS16.5.sdk missing"; exit 1; }
 
+      - name: Bootstrap Theos Swift support before parallel targets
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: make bootstrap-swift-support THEOS="$THEOS"
+
       - name: Cache ChOma source dependency
         uses: actions/cache@v4
         with:
           path: project/ChOma
-          key: choma-source-${{ runner.os }}-opa334-main-v1
+          key: choma-source-${{ runner.os }}-964023ddac2286ef8e843f90df64d44ac6a673df-v2
 
-      - name: Fetch ChOma dependency
+      - name: Fetch and validate TrollStore-compatible ChOma revision
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! -f ChOma/src/CSBlob.h || ! -f ChOma/external/ios/libcrypto.a ]]; then
-            rm -rf ChOma
-            git clone --depth 1 --recurse-submodules https://github.com/opa334/ChOma.git ChOma
-          fi
-          test -f ChOma/src/CSBlob.h || { echo "error: ChOma/src/CSBlob.h is missing"; exit 1; }
-          test -f ChOma/external/ios/libcrypto.a || { echo "error: ChOma/external/ios/libcrypto.a is missing"; exit 1; }
+          make bootstrap-deps CHOMA_COMMIT=964023ddac2286ef8e843f90df64d44ac6a673df
 
       - name: Validate bundled precompiled device ldid
         working-directory: ${{ env.PROJECT_DIR }}
