@@ -1,0 +1,276 @@
+name: Build TrollInstallerX (Custom)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'TrollInstallerX.zip'
+      - '.github/workflows/TrollInstallerX.yml'
+  pull_request:
+    paths:
+      - 'TrollInstallerX.zip'
+      - '.github/workflows/TrollInstallerX.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trollinstallerx-custom-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build iOS IPA (Xcode 16.4)
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    env:
+      SOURCE_ARCHIVE: TrollInstallerX.zip
+      XCODE_DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Check and extract TrollInstallerX.zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "$GITHUB_WORKSPACE/$SOURCE_ARCHIVE" ]]; then
+            echo "::error::Missing $SOURCE_ARCHIVE in the repository root."
+            exit 1
+          fi
+
+          EXTRACT_DIR="$RUNNER_TEMP/TrollInstallerX-source"
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+
+          python3 - "$GITHUB_WORKSPACE/$SOURCE_ARCHIVE" "$EXTRACT_DIR" "$GITHUB_ENV" <<'PY'
+          import os
+          import stat
+          import sys
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          archive = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+          github_env = Path(sys.argv[3])
+
+          try:
+              with zipfile.ZipFile(archive) as zf:
+                  infos = zf.infolist()
+                  if not infos:
+                      raise SystemExit("TrollInstallerX.zip is empty")
+
+                  seen = set()
+                  for info in infos:
+                      name = info.filename.replace("\\", "/")
+                      path = PurePosixPath(name)
+                      if path.is_absolute() or ".." in path.parts:
+                          raise SystemExit(f"Unsafe ZIP entry: {info.filename}")
+                      if name in seen:
+                          raise SystemExit(f"Duplicate ZIP entry: {info.filename}")
+                      seen.add(name)
+
+                      mode = (info.external_attr >> 16) & 0o170000
+                      if mode == stat.S_IFLNK:
+                          raise SystemExit(f"Symbolic links are not allowed in source ZIP: {info.filename}")
+
+                  zf.extractall(destination)
+          except zipfile.BadZipFile as exc:
+              raise SystemExit(f"TrollInstallerX.zip is not a valid ZIP archive: {exc}")
+
+          required = (
+              "TrollInstallerX.xcodeproj/project.pbxproj",
+              "TrollInstallerX.xcodeproj/xcshareddata/xcschemes/TrollInstallerX.xcscheme",
+              "build.sh",
+              "Scripts/validate_custom_payload.py",
+              "Resources/ents.plist",
+              "TrollInstallerX/Resources/TrollStore.tar",
+          )
+
+          candidates = []
+          for project in destination.rglob("TrollInstallerX.xcodeproj"):
+              root = project.parent
+              if project.is_dir() and all((root / item).is_file() for item in required):
+                  candidates.append(root)
+
+          if len(candidates) != 1:
+              found = "\n".join(str(item) for item in candidates) or "(none)"
+              raise SystemExit(
+                  "Expected exactly one custom TrollInstallerX source root containing "
+                  "the Xcode project, build.sh, validator, entitlements and embedded payload. "
+                  f"Found: {len(candidates)}\n{found}"
+              )
+
+          source_root = candidates[0].resolve()
+          with github_env.open("a", encoding="utf-8") as env_file:
+              env_file.write(f"TIX_SOURCE_DIR={source_root}\n")
+
+          print(f"Source root: {source_root}")
+          print(f"Archive size: {archive.stat().st_size} bytes")
+          PY
+
+      - name: Select Xcode 16.4 and show SDK versions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d "$XCODE_DEVELOPER_DIR" ]]; then
+            echo "::error::Xcode 16.4 was not found at $XCODE_DEVELOPER_DIR"
+            ls -1 /Applications | grep -E '^Xcode' || true
+            exit 1
+          fi
+
+          sudo xcode-select --switch "$XCODE_DEVELOPER_DIR"
+          sudo xcodebuild -license accept
+          xcodebuild -version
+          printf 'iOS SDK: '
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --show-sdk-platform-path
+
+      - name: Validate custom payload and project metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$TIX_SOURCE_DIR"
+
+          python3 Scripts/validate_custom_payload.py TrollInstallerX/Resources/TrollStore.tar
+          plutil -lint Resources/ents.plist
+          plutil -lint TrollInstallerX.xcodeproj/project.pbxproj
+
+          python3 - <<'PY'
+          import plistlib
+          import re
+          from pathlib import Path
+
+          entitlements_path = Path("Resources/ents.plist")
+          with entitlements_path.open("rb") as stream:
+              entitlements = plistlib.load(stream)
+
+          expected_identifier = "TROLLTROLL.com.trollstore.custominstaller"
+          actual_identifier = entitlements.get("application-identifier")
+          if actual_identifier != expected_identifier:
+              raise SystemExit(
+                  f"Unexpected application-identifier: {actual_identifier!r}; "
+                  f"expected {expected_identifier!r}"
+              )
+          if entitlements.get("com.apple.developer.team-identifier") != "TROLLTROLL":
+              raise SystemExit("Unexpected custom team identifier in Resources/ents.plist")
+
+          project = Path("TrollInstallerX.xcodeproj/project.pbxproj").read_text(encoding="utf-8")
+          if "PRODUCT_BUNDLE_IDENTIFIER = com.trollstore.custominstaller;" not in project:
+              raise SystemExit("Xcode PRODUCT_BUNDLE_IDENTIFIER does not match custom entitlements")
+          if not re.search(r"IPHONEOS_DEPLOYMENT_TARGET\s*=\s*14\.0\s*;", project):
+              raise SystemExit("Expected iOS deployment target 14.0 was not found")
+
+          print("[OK] Bundle identifier, custom entitlements and deployment target verified")
+          PY
+
+      - name: Install host ldid
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ldid
+          HOST_LDID="$(command -v ldid)"
+          test -x "$HOST_LDID"
+          echo "Host ldid: $HOST_LDID"
+          brew list --versions ldid
+          echo "LDID_BIN=$HOST_LDID" >> "$GITHUB_ENV"
+
+      - name: Build Release IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$TIX_SOURCE_DIR"
+          chmod +x build.sh Scripts/validate_custom_payload.py
+          LDID_BIN="$LDID_BIN" ./build.sh
+
+      - name: Verify IPA and embedded custom TrollStore payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$TIX_SOURCE_DIR"
+
+          python3 - TrollInstallerX.ipa TrollInstallerX/Resources/TrollStore.tar <<'PY'
+          import hashlib
+          import plistlib
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          ipa_path = Path(sys.argv[1])
+          source_payload = Path(sys.argv[2])
+          if not ipa_path.is_file() or ipa_path.stat().st_size == 0:
+              raise SystemExit("Build did not produce a non-empty TrollInstallerX.ipa")
+
+          with zipfile.ZipFile(ipa_path) as ipa:
+              bad_member = ipa.testzip()
+              if bad_member:
+                  raise SystemExit(f"Corrupt IPA entry: {bad_member}")
+
+              app_prefix = "Payload/TrollInstallerX.app/"
+              executable_name = app_prefix + "TrollInstallerX"
+              info_name = app_prefix + "Info.plist"
+              payload_name = app_prefix + "TrollStore.tar"
+
+              names = set(ipa.namelist())
+              for required in (executable_name, info_name, payload_name):
+                  if required not in names:
+                      raise SystemExit(f"Missing IPA entry: {required}")
+
+              info = plistlib.loads(ipa.read(info_name))
+              if info.get("CFBundleIdentifier") != "com.trollstore.custominstaller":
+                  raise SystemExit(
+                      "Unexpected IPA bundle identifier: "
+                      f"{info.get('CFBundleIdentifier')!r}"
+                  )
+              if info.get("CFBundleExecutable") != "TrollInstallerX":
+                  raise SystemExit("Unexpected CFBundleExecutable in IPA Info.plist")
+
+              executable = ipa.read(executable_name)
+              if len(executable) < 8 or executable[:4] != bytes.fromhex("cffaedfe"):
+                  raise SystemExit("TrollInstallerX executable is not a 64-bit Mach-O")
+              cpu_type = int.from_bytes(executable[4:8], "little", signed=True)
+              if cpu_type != 0x0100000C:
+                  raise SystemExit(
+                      f"Expected arm64 executable, found cputype=0x{cpu_type & 0xffffffff:08x}"
+                  )
+
+              embedded_hash = hashlib.sha256(ipa.read(payload_name)).hexdigest()
+              source_hash = hashlib.sha256(source_payload.read_bytes()).hexdigest()
+              if embedded_hash != source_hash:
+                  raise SystemExit("The IPA's TrollStore.tar differs from the validated source payload")
+
+          print(f"[OK] IPA: {ipa_path} ({ipa_path.stat().st_size} bytes)")
+          print(f"[OK] arm64 executable and bundle ID verified")
+          print(f"[OK] Embedded TrollStore.tar SHA-256: {source_hash}")
+          PY
+
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp TrollInstallerX.ipa "$GITHUB_WORKSPACE/artifacts/TrollInstallerX.ipa"
+          cp PAYLOAD-SHA256.txt "$GITHUB_WORKSPACE/artifacts/PAYLOAD-SHA256.txt"
+          shasum -a 256 "$GITHUB_WORKSPACE/artifacts/TrollInstallerX.ipa" \
+            > "$GITHUB_WORKSPACE/artifacts/TrollInstallerX.ipa.sha256"
+
+          {
+            echo "Source archive SHA-256: $(shasum -a 256 "$GITHUB_WORKSPACE/$SOURCE_ARCHIVE" | awk '{print $1}')"
+            echo "Xcode: $(xcodebuild -version | tr '\n' ' ')"
+            echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+            echo "Host ldid: $(brew list --versions ldid)"
+            echo "Bundle ID: com.trollstore.custominstaller"
+            echo "Minimum iOS: 14.0"
+          } > "$GITHUB_WORKSPACE/artifacts/Build-Info.txt"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: TrollInstallerX-Custom-IPA
+          path: |
+            artifacts/TrollInstallerX.ipa
+            artifacts/TrollInstallerX.ipa.sha256
+            artifacts/PAYLOAD-SHA256.txt
+            artifacts/Build-Info.txt
+          if-no-files-found: error
+          retention-days: 30
